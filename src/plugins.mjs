@@ -16,8 +16,10 @@
 import { existsSync, readdirSync } from 'node:fs'
 import Vec3 from 'vec3'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { createRequire } from 'node:module'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resolveHarnessHome } from './format.mjs'
+import { ensureDepGuard, isLandmineError, describeDepGuard } from './dep-guard.mjs'
 import { withTimeout } from './async-util.mjs'
 import { scaffoldingItemIds } from './place-items.mjs'
 import { patchDigTime } from './dig-speed.mjs'
@@ -62,6 +64,8 @@ export const MC_DEPS = {
 
 const DEP_OFF = /^(off|0|false|no|none)$/i
 const _depCache = new Map()
+/** 地雷自愈只做一次（扫整棵依赖树要一秒多；修过之后再来就不必重复扫） */
+let _landmineGuardTried = false
 
 /**
  * `import()` 出来的模块可能是 CJS 也可能是 ESM，具名导出还不全 ——
@@ -77,6 +81,42 @@ function pickExport (mod, names) {
 }
 
 /**
+ * 用 **CJS 的 `require()`** 装载一个候选（`file:` URL 或裸包名），装不上返回 `null`。
+ *
+ * 🔴 2026-11-18 真机：DSH 宿主里 **6 个 vendor 插件全部**加载不上，日志是
+ *
+ *     pathfinder 候选不可用（file:///C:/Users/Stone/.dsh/profiles/desktop/vendor/mc-deps/…）：
+ *       createRequire.resolve.paths is not a function or its return value is not iterable
+ *
+ * 这不是"包没装"：同一份 `node_modules` 用 `node` 跑 `createRequire()` 逐个 `require` 是**全部成功**的
+ * （pathfinder/collectblock/tool/pvp/hawkeye/auto-eat 六项都 OK）。所以是**宿主运行时**里
+ * `import()` 一个 **CJS** 包的互操作路径坏了 —— 报错在宿主的 ESM loader 里就抛了，
+ * 根本走不到下面的 `pickExport`，看起来就像"缺插件"。
+ *
+ * `require()` 走的是老的那条 CJS 解析路径，不碰 ESM loader 的 `.paths`，所以：
+ * **CJS 优先 `require`，装不上再 `import()`**（纯 ESM / 带 top-level await 的包 require 会抛，
+ * 那些交给 `import()` 兜）。两者形状兼容 —— `require` 返回的就是 `module.exports` 本体，
+ * `pickExport` 的 `m[n]` 一路正好命中；而 `import()` 多套的那层 `default` 它也已经看了。
+ */
+let _cjsRequire
+function cjsRequire (cand) {
+  if (_cjsRequire === undefined) {
+    try { _cjsRequire = createRequire(import.meta.url) } catch { _cjsRequire = null }
+  }
+  if (!_cjsRequire) return null
+  let spec = cand
+  if (cand.startsWith('file:')) {
+    try { spec = fileURLToPath(cand) } catch { return null }
+  }
+  try {
+    return _cjsRequire(spec)
+  } catch {
+    // ERR_REQUIRE_ESM / ERR_REQUIRE_ASYNC_MODULE / 真·不存在 —— 统一让 import() 再试一次并报错
+    return null
+  }
+}
+
+/**
  * 找一个 vendor 依赖并 `import()` 它。**只缓存成功**：找不到时每次调用都重新试一遍。
  * （踩过的坑：以前把"找不到"也缓存了，结果在 vendor 树里修好文件之后，
  *   进程内再也等不到重试 —— 只能重启 DSH。失败重试很便宜，只在连接时发生。）
@@ -89,6 +129,7 @@ export async function loadMcDep (key, { log = null, logWarn = null, spec = null 
   if (_depCache.has(key)) return _depCache.get(key)
   const info = MC_DEPS[key]
   if (!info) throw new Error(`未知的 vendor 依赖：${key}（可用：${Object.keys(MC_DEPS).join(' / ')}）`)
+  let landmineErr = null                       // 认出「尾斜杠内置名」地雷时留个证据（见函数尾）
   const raw = spec ?? process.env.DSH_MC_AGENT_MC_DEPS ?? null
   const cands = []
   if (raw && !DEP_OFF.test(String(raw).trim())) {
@@ -127,7 +168,11 @@ export async function loadMcDep (key, { log = null, logWarn = null, spec = null 
   for (const c of cands) {
     const where = c.startsWith('file:') ? 'vendor 树' : c
     try {
-      const m = await import(c)
+      // CJS 优先（见 `cjsRequire` 的注释：宿主 import() 一个 CJS 包会崩在 ESM loader 里）
+      const viaReq = cjsRequire(c)
+      const m = viaReq ?? await import(c)
+      // 日志里标出走的哪条通道：宿主上"装好了却加载不上"时，这一行就是分水岭
+      const how = viaReq ? 'require' : 'import'
       if (key === 'pathfinder') {
         // ⚠️ 它是 CJS：`import()` 出来的具名导出**不全**（实测只有 Movements/pathfinder，
         //    `goals` 只在 default 上）—— 所以两边都要看，凑成一个完整对象。
@@ -138,7 +183,7 @@ export async function loadMcDep (key, { log = null, logWarn = null, spec = null 
         }
         if (mod.pathfinder && mod.Movements && mod.goals) {
           _depCache.set(key, mod)
-          log?.(`已找到现成的${info.label}（${where}）`)
+          log?.(`已找到现成的${info.label}（${where}·${how}）`)
           return mod
         }
         ;(logWarn ?? log)?.(`pathfinder 候选不是预期的模块：${c}`)
@@ -157,13 +202,38 @@ export async function loadMcDep (key, { log = null, logWarn = null, spec = null 
       }
       if (typeof fn === 'function') {
         _depCache.set(key, fn)
-        log?.(`已找到现成的${info.label}（${where}）`)
+        log?.(`已找到现成的${info.label}（${where}·${how}）`)
         return fn
       }
       ;(logWarn ?? log)?.(`${key} 候选不是预期的模块：${c}`)
     } catch (e) {
+      if (isLandmineError(e)) landmineErr = e
       ;(logWarn ?? log)?.(`${key} 候选不可用（${c.startsWith('file:') ? c.slice(0, 60) + '…' : c}）：${e?.code ?? e?.message}`)
     }
+  }
+  /* 🔴 2026-11-18 真机（用户「装了 pathfinder 还是说没加载」）：
+   *
+   *   vendor 树是**按 PATHFINDER.md 手工 `npm install` 铺的**，而 `readable-stream` 里那行
+   *   `require('string_decoder/')`（尾斜杠）是 `postinstall → fix-mc-deps.mjs --auto` 才拆的
+   *   —— 手工装不进 `postinstall`，于是地雷回来了：`import()` 在**宿主**的解析器里抛
+   *   `createRequire.resolve.paths is not a function`，6 个 vendor 插件**一起**静默失联，
+   *   表现就像「缺 mineflayer-pathfinder」。日志里那条错误码不是 ERR_MODULE_NOT_FOUND，
+   *   而是这句 TypeError —— 这是唯一能区分「没装」和「装了加载不上」的线索。
+   *
+   *   这里跟 `ensureMineflayer()` 同款自愈：整轮候选都失败且认出是地雷 ⇒ 就地修一遍再重来。
+   *   进程内只修一次（扫树要一秒多，不能每个 key 都扫）；`DSH_MC_AGENT_DEP_GUARD=off` 可关。 */
+  if (landmineErr && !_landmineGuardTried) {
+    _landmineGuardTried = true
+    const off = String(process.env.DSH_MC_AGENT_DEP_GUARD ?? '').toLowerCase() === 'off'
+    let patched = false
+    try {
+      const rep = ensureDepGuard({ log: logWarn, patch: !off })
+      patched = rep.patched > 0
+      ;(logWarn ?? log)?.('vendor 依赖加载撞上「尾斜杠内置名」：' + describeDepGuard(rep))
+    } catch (e) {
+      ;(logWarn ?? log)?.('修 vendor 依赖树失败：' + (e?.message ?? e))
+    }
+    if (patched) return await loadMcDep(key, { log, logWarn, spec })
   }
   // 故意不缓存失败：修好 vendor 树后，下一次连接（不用重启 DSH）就能加载上
   return null

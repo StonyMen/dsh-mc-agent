@@ -49,6 +49,44 @@ protodef 对未知包名不报错，会写出「id=0x00 + 空 body」，服务�
 **用户影响**：连 26.1 及以上的服不用再降级服务端、也不用再关移动校验了。
 连 1.21.x 的服行为完全不变（协议里没这个包，补丁自动不启用）。
 
+### 装了 pathfinder 却一直说「寻路没加载」
+
+**现象**：按说明把 `mineflayer-pathfinder` 装进 profile 的 `vendor/mc-deps`，文件确确实实在那儿，
+但一走路就返回
+
+```
+via: "pathfinder-unavailable" / reason: "PathfinderUnavailable"
+hint: mineflayer-pathfinder 没有加载，已停止移动，避免盲跳
+```
+
+重装、重启都不管用；日志里也找不到「找不到包」那类提示。
+
+**根因**：不是没装，是**装上了却加载不进来**。日志里真正的那一行是
+
+```
+pathfinder 候选不可用（…/vendor/mc-deps/…）：
+  createRequire.resolve.paths is not a function or its return value is not iterable
+```
+
+`mineflayer → minecraft-protocol → readable-stream` 里有两行带**尾斜杠的内置名**
+（`require('string_decoder/')`、`require('process/')`）。宿主的模块解析器碰到这种写法会去
+`resolve.paths()` 拿一个 `null` 再 `for...of`，于是整个 `import()` 崩掉 —— 崩在宿主里，
+根本轮不到我们挑导出。**6 个 vendor 插件（寻路/挖捡/换工具/打怪/弹道/自动吃）是一起失联的**，
+只是寻路最显眼，看起来就像"只缺 pathfinder"。
+
+这个雷项目本来就防着：`tools/fix-mc-deps.mjs` 会把它拆掉，`npm install` 之后自动跑。
+但 **vendor 树是按说明手工 `npm install` 铺的，`postinstall` 压根不会执行**，所以每次重装都会复发一次。
+
+**修法**（两层，都不改别人的包）：
+
+- **加载器先走 `require()`，装不上再 `import()`**：`require` 走的是老的 CJS 路径，不经过宿主那段会崩的解析，
+  同一份依赖树六个插件全部正常拿到。日志里现在会标出走的哪条通道（`vendor 树·require`）。
+- **认出来了就自己修**：整轮候选都失败、而且错误正是那句 `createRequire.resolve.paths` 时，
+  就地跑一遍依赖修补再重试，跟 `mineflayer` 那边早就有的自愈一个套路。以后重装 vendor 树不用再记着补跑脚本。
+
+**用户影响**：`pathfinder-unavailable` 消失，走路回到 A* 寻路；挖/捡、换工具、打怪、自动吃、弹道这些
+"跟着一起哑掉"的能力同时恢复。真机日志里那条 `candidate 不可用 … createRequire.resolve.paths` 不会再出现。
+
 ## [0.6.78] - 2026-11-05
 
 这一版收掉「走不动 / 乱跳 / 往岩浆里走 / 一个报错就把整个应用带走」这几件，另外按用户 20 小时实测报告治了合成与攻击。
