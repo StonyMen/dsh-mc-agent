@@ -27,6 +27,7 @@
 import { ensureDepGuard, isLandmineError, describeDepGuard } from './dep-guard.mjs'
 import { sleep } from './async-util.mjs'
 import { patchBlockAt } from './vec-arg.mjs'
+import { patchClientTickEnd } from './tick-end.mjs'
 import { dashUuid } from './accounts.mjs'
 import { makeSession } from './auth-session.mjs'
 
@@ -209,6 +210,9 @@ export async function connect (self, opts = {}, ctx = {}) {
     })
     b._createdAt = Date.now()
     patchBlockAt(b)
+    /* 26.1+ 服务端「每 tick 只许一个位置包」，收尾要靠 `tick_end` —— mineflayer 从不发，
+     * 不补就是进服 1~2 秒被 `Invalid move player packet received` 踢掉（2026-11-18 实机）。 */
+    patchClientTickEnd(b)
 
     let dupe = false
     b.on('error', (e) => { ctx.reportError?.(e) })
